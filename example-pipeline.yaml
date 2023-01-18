@@ -1,0 +1,162 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: 'This template creates a single pipeline with:
+ - source stage,
+ - approve test stack stage
+ - test stage
+ - approval change set stage with Cloudformation
+ - create change set stage.'
+
+Metadata:
+  Author: FilipKamenar
+
+Parameters:
+  BranchName:
+    Description: CodeCommit branch name
+    Type: String
+    Default: main
+  RepositoryName:
+    Description: CodeCommit repository name where CloudFormation source code is saved.
+    Type: String
+  StackName:
+    Description: Name of the stack.
+    Type: String
+    Default: MyExampleStack
+  CodePipelineRoleARN:
+    Description: Define arn of Role used with CodePipeline to deploy infrastructure.
+    Type: String
+
+Resources:
+  CodePipelineArtifactStoreBucket:
+    Type: 'AWS::S3::Bucket'
+  CodePipelineArtifactStoreBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref CodePipelineArtifactStoreBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: DenyUnEncryptedObjectUploads
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Join
+              - ''
+              - - !GetAtt
+                  - CodePipelineArtifactStoreBucket
+                  - Arn
+                - /*
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption': 'aws:kms'
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: !Join
+              - ''
+              - - !GetAtt
+                  - CodePipelineArtifactStoreBucket
+                  - Arn
+                - /*
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  InfraPipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      Name: Deploy_BAAPI_Infrastructure
+      RoleArn: !Ref CodePipelineRoleARN
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: '1'
+                Provider: CodeCommit
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                BranchName: !Ref BranchName
+                RepositoryName: !Ref RepositoryName
+                PollForSourceChanges: false
+        - Name: TestingStage
+          Actions:
+            - Name: ApproveTestingPhase
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                CustomData: !Sub 'Do you want to create a new testing stack Test${StackName}?'
+              RunOrder: 1
+            - Name: DeployTestingStack
+              InputArtifacts:
+                - Name: SourceOutput
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: '1'
+                Provider: CloudFormation
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                RoleArn: !Ref CodePipelineRoleARN
+                Capabilities: CAPABILITY_NAMED_IAM
+                StackName: !Sub "Test${StackName}"
+                TemplateConfiguration: "SourceOutput::test-infra-params.json"
+                TemplatePath: 'SourceOutput::infra.yaml'
+              RunOrder: 2
+            - Name: ApproveDeletingTestingStack
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                CustomData: !Sub 'Do you want to create a change set against the production stack and delete the Test${StackName} stack?'
+              RunOrder: 3
+            - Name: DeleteTestingStack
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: DELETE_ONLY
+                RoleArn: !Ref CodePipelineRoleARN
+                StackName: !Sub "Test${StackName}"
+              RunOrder: 4
+        - Name: ProductionStage
+          Actions:
+            - Name: ApproveProductionPhase
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                CustomData: !Sub 'Do you want to create a new production stack Prod${StackName}?'
+              RunOrder: 1            
+            - Name: DeployProductionStack
+              InputArtifacts:
+                - Name: SourceOutput
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: '1'
+                Provider: CloudFormation
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                RoleArn: !Ref CodePipelineRoleARN
+                Capabilities: CAPABILITY_NAMED_IAM
+                ChangeSetName: !Sub "Prod${StackName}"
+                StackName: !Sub "Prod${StackName}"
+                TemplateConfiguration: "SourceOutput::prod-infra-params.json"
+                TemplatePath: 'SourceOutput::infra.yaml'
+              RunOrder: 2
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodePipelineArtifactStoreBucket
